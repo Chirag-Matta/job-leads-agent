@@ -1,16 +1,24 @@
 """
 tools/tracker.py
 
-Uses Notion Page + Blocks API to append job application records
-as table rows directly into your Job Application Tracker page.
+Writes job application records to your Notion page.
 
-Page ID: 2e8b094e7717801d9192f6456308c5c2
+Structure per company:
+  ─────────────────────────────────
+  ### XYZ AI — Backend Engineer  |  discovered  |  2026-03-16
+    📋 Job: <url>
+
+  [HR]      Priya S.  |  priya@xyz.ai  |  mail_sent
+  [HR]      Ankit M.  |  ankit@xyz.ai  |  discovered
+  [SDE]     Rahul K.  |  rahul@xyz.ai  |  mail_sent
+  [SDE]     Sneha R.  |  sneha@xyz.ai  |  discovered
+  [Founder] Varun T.  |  varun@xyz.ai  |  mail_sent
 """
 
 import requests
 import logging
 from datetime import date
-from typing import Optional
+from typing import Optional, List, Dict
 from config import config
 
 logger = logging.getLogger(__name__)
@@ -24,7 +32,7 @@ HEADERS = {
     "Content-Type": "application/json",
 }
 
-# Status values
+# Status values used across agents
 STATUS_DISCOVERED = "discovered"
 STATUS_MAIL_SENT  = "mail_sent"
 STATUS_FOLLOWUP   = "followup_sent"
@@ -32,84 +40,91 @@ STATUS_INTERVIEW  = "interview"
 STATUS_REJECTED   = "rejected"
 STATUS_RECONTACT  = "recontact_later"
 
+TYPE_LABELS = {
+    "hr":      "HR",
+    "sde":     "SDE",
+    "founder": "Founder",
+}
 
-def save_company_record(
+
+# ── Write ─────────────────────────────────────────────────────
+
+def save_company_with_contacts(
     company: str,
     role: str,
-    contact_name: str,
-    contact_email: str,
-    contact_title: str,
-    job_url: str = "",
-    company_linkedin: str = "",
+    job_url: str,
+    contacts: List[Dict],
 ) -> Optional[str]:
     """
-    Appends a new job application entry as a styled text block
-    to your Notion tracker page.
-    Returns the block ID on success, None on failure.
+    Append one company heading + one bullet per contact to the Notion page.
+    Returns the heading block ID or None on failure.
+
+    contacts: list of {name, title, linkedin_url, contact_type, email}
     """
     today = str(date.today())
-    
-    # Build a readable text block for the entry
-    lines = [
-        f"🏢  {company}  |  {role}  |  {today}  |  {STATUS_DISCOVERED}",
-        f"👤  {contact_name or 'Unknown'}  —  {contact_title or 'Unknown'}  —  {contact_email or 'No email'}",
-    ]
-    if job_url:
-        lines.append(f"🔗  {job_url}")
-
     children = []
 
-    # Divider before each entry
+    # ── Divider ──
     children.append({"object": "block", "type": "divider", "divider": {}})
 
-    # Heading: company + role
+    # ── Company heading ──
     children.append({
         "object": "block",
         "type": "heading_3",
         "heading_3": {
-            "rich_text": [{"type": "text", "text": {"content": f"{company} — {role}"}}]
-        }
-    })
-
-    # Contact info
-    children.append({
-        "object": "block",
-        "type": "bulleted_list_item",
-        "bulleted_list_item": {
             "rich_text": [{"type": "text", "text": {
-                "content": f"Contact: {contact_name or 'Unknown'} ({contact_title or 'Unknown'}) — {contact_email or 'No email found'}"
+                "content": f"{company} — {role}  |  {STATUS_DISCOVERED}  |  {today}"
             }}]
         }
     })
 
-    # Status + date
-    children.append({
-        "object": "block",
-        "type": "bulleted_list_item",
-        "bulleted_list_item": {
-            "rich_text": [{"type": "text", "text": {
-                "content": f"Status: {STATUS_DISCOVERED}  |  Date: {today}"
-            }}]
-        }
-    })
-
-    # Job URL
+    # ── Job URL ──
     if job_url:
         children.append({
             "object": "block",
             "type": "bulleted_list_item",
             "bulleted_list_item": {
-                "rich_text": [{
-                    "type": "text",
-                    "text": {"content": "Job post: ", "link": None},
-                }, {
-                    "type": "text",
-                    "text": {"content": job_url, "link": {"url": job_url}},
-                }]
+                "rich_text": [
+                    {"type": "text", "text": {"content": "Job post: "}},
+                    {"type": "text", "text": {"content": job_url, "link": {"url": job_url}}},
+                ]
             }
         })
 
-    # Retry up to 3 times on timeout/failure
+    # ── One block per contact ──
+    for c in contacts:
+        label    = TYPE_LABELS.get(c.get("contact_type", ""), "Contact")
+        name     = c.get("name", "Unknown")
+        title    = c.get("title", "")
+        email    = c.get("email", "") or "No email"
+        li_url   = c.get("linkedin_url", "")
+
+        # Build rich text: [TYPE] Name (Title) | email
+        rich = []
+
+        # Type badge text
+        rich.append({"type": "text", "text": {"content": f"[{label}]  "}})
+
+        # Name as LinkedIn link if available
+        if li_url:
+            rich.append({"type": "text", "text": {
+                "content": name, "link": {"url": li_url}
+            }})
+        else:
+            rich.append({"type": "text", "text": {"content": name}})
+
+        if title:
+            rich.append({"type": "text", "text": {"content": f"  ({title})"}})
+
+        rich.append({"type": "text", "text": {"content": f"  |  {email}  |  {STATUS_DISCOVERED}"}})
+
+        children.append({
+            "object": "block",
+            "type": "bulleted_list_item",
+            "bulleted_list_item": {"rich_text": rich}
+        })
+
+    # ── Write to Notion (retry 3x) ──
     for attempt in range(3):
         try:
             resp = requests.patch(
@@ -118,58 +133,72 @@ def save_company_record(
                 headers=HEADERS,
                 timeout=20,
             )
-
             if resp.status_code == 200:
-                block_id = resp.json()["results"][0]["id"]
-                logger.info(f"Saved to Notion page: {company} | block={block_id}")
-                return block_id
+                heading_id = resp.json()["results"][1]["id"]  # [0]=divider, [1]=heading
+                logger.info(f"Saved: {company} with {len(contacts)} contacts")
+                return heading_id
             else:
-                logger.error(f"Notion append failed for {company}: {resp.status_code} {resp.text}")
+                logger.error(f"Notion save failed ({resp.status_code}): {resp.text[:200]}")
                 return None
         except requests.exceptions.Timeout:
-            logger.warning(f"Notion timeout for {company} (attempt {attempt + 1}/3)")
-            if attempt == 2:
-                logger.error(f"Notion save failed for {company} after 3 retries")
-                return None
-        except Exception as e:
-            logger.error(f"Notion save failed for {company}: {e}")
-            return None
+            logger.warning(f"Notion timeout for {company} (attempt {attempt+1}/3)")
+    return None
 
 
-def update_application_status(page_id: str, status: str, notes: str = "") -> bool:
+def update_contact_status(block_id: str, new_status: str) -> bool:
     """
-    Appends a status-update note block under an existing entry.
-    (page_id here is actually the block_id of the heading block)
+    Update a single contact bullet block — replace its status text.
+    block_id: the ID of the bulleted_list_item block for that contact.
     """
-    today = str(date.today())
-    content = f"→ Status updated: {status}  |  {today}"
-    if notes:
-        content += f"  |  {notes}"
+    # Fetch current block text first
+    try:
+        resp = requests.get(
+            f"{NOTION_API}/blocks/{block_id}",
+            headers=HEADERS,
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return False
 
-    children = [{
-        "object": "block",
-        "type": "callout",
-        "callout": {
-            "rich_text": [{"type": "text", "text": {"content": content}}],
-            "icon": {"emoji": "📬"},
-            "color": "blue_background",
-        }
-    }]
+        block = resp.json()
+        rich  = block.get("bulleted_list_item", {}).get("rich_text", [])
 
-    resp = requests.patch(
-        f"{NOTION_API}/blocks/{page_id}/children",
-        json={"children": children},
-        headers=HEADERS,
-        timeout=10,
-    )
-    return resp.status_code == 200
+        # Update the last text segment that contains the old status
+        for rt in reversed(rich):
+            text = rt.get("text", {}).get("content", "")
+            for old_status in [STATUS_DISCOVERED, STATUS_MAIL_SENT,
+                               STATUS_FOLLOWUP, STATUS_INTERVIEW,
+                               STATUS_REJECTED, STATUS_RECONTACT]:
+                if old_status in text:
+                    rt["text"]["content"] = text.replace(old_status, new_status)
+                    break
+
+        # Write back
+        update_resp = requests.patch(
+            f"{NOTION_API}/blocks/{block_id}",
+            json={"bulleted_list_item": {"rich_text": rich}},
+            headers=HEADERS,
+            timeout=10,
+        )
+        return update_resp.status_code == 200
+
+    except Exception as e:
+        logger.error(f"update_contact_status failed: {e}")
+        return False
 
 
-def get_discovered_companies() -> list:
+# ── Read ──────────────────────────────────────────────────────
+
+def get_discovered_companies() -> List[Dict]:
     """
-    Reads all blocks from the tracker page and extracts
-    entries that contain 'status: discovered'.
-    Returns list of dicts for the outreach agent.
+    Read the Notion page and return companies that have at least
+    one contact with status=discovered.
+
+    Returns a list of company dicts, each with a 'contacts' list:
+    {
+      page_id, company, role, job_url,
+      contacts: [{block_id, name, title, email, contact_type, status}]
+    }
     """
     resp = requests.get(
         f"{NOTION_API}/blocks/{PAGE_ID}/children?page_size=100",
@@ -180,58 +209,102 @@ def get_discovered_companies() -> list:
         logger.error(f"Could not read Notion page: {resp.text}")
         return []
 
-    blocks = resp.json().get("results", [])
+    blocks  = resp.json().get("results", [])
     records = []
-    current = {}
+    current = None
 
     for block in blocks:
         btype = block.get("type")
         text  = _block_text(block)
 
-        # Heading_3 = new company entry
-        if btype == "heading_3" and "—" in text:
-            if current:
+        # New company heading
+        if btype == "heading_3" and "—" in text and "|" in text:
+            if current and current["contacts"]:
                 records.append(current)
-            parts = text.split("—", 1)
+            parts  = text.split("—", 1)
+            company = parts[0].strip()
+            rest    = parts[1].split("|")[0].strip() if len(parts) > 1 else ""
             current = {
-                "page_id":       block["id"],
-                "company":       parts[0].strip(),
-                "role":          parts[1].strip() if len(parts) > 1 else "",
-                "contact_name":  "",
-                "contact_email": "",
-                "contact_title": "",
-                "job_url":       "",
-                "status":        "",
+                "page_id":  block["id"],
+                "company":  company,
+                "role":     rest,
+                "job_url":  "",
+                "contacts": [],
             }
 
-        elif btype == "bulleted_list_item" and current:
-            if text.startswith("Contact:"):
-                # "Contact: Name (Title) — email"
-                rest = text.replace("Contact:", "").strip()
-                email_part = rest.split("—")[-1].strip() if "—" in rest else ""
-                name_title = rest.split("—")[0].strip() if "—" in rest else rest
-                current["contact_email"] = email_part if "@" in email_part else ""
-                if "(" in name_title:
-                    current["contact_name"]  = name_title.split("(")[0].strip()
-                    current["contact_title"] = name_title.split("(")[1].rstrip(")").strip()
-
-            elif text.startswith("Status:"):
-                status_part = text.split("|")[0].replace("Status:", "").strip()
-                current["status"] = status_part
-
-            elif text.startswith("Job post:"):
+        elif current and btype == "bulleted_list_item":
+            # Job URL line
+            if text.startswith("Job post:"):
                 current["job_url"] = text.replace("Job post:", "").strip()
+                continue
 
-    if current:
+            # Contact line: [HR]  Name (Title)  |  email  |  status
+            contact = _parse_contact_block(block, text)
+            if contact:
+                current["contacts"].append(contact)
+
+    if current and current["contacts"]:
         records.append(current)
 
-    # Filter to only discovered ones
-    discovered = [r for r in records if r.get("status") == STATUS_DISCOVERED]
-    logger.info(f"Found {len(discovered)} discovered companies on Notion page")
-    return discovered
+    # Filter: only companies that have at least one undiscovered contact
+    result = []
+    for r in records:
+        undiscovered = [c for c in r["contacts"] if c["status"] == STATUS_DISCOVERED]
+        if undiscovered:
+            r["contacts"] = undiscovered
+            result.append(r)
+
+    logger.info(f"Found {len(result)} companies with undiscovered contacts")
+    return result
+
+
+def _parse_contact_block(block: dict, text: str) -> Optional[Dict]:
+    """Parse a contact bullet block into a structured dict."""
+    # Must start with [TYPE]
+    m = re.match(r"\[(\w+)\]\s+(.+)", text)
+    if not m:
+        return None
+
+    contact_type_label = m.group(1).lower()  # hr | sde | founder
+    rest = m.group(2)
+
+    # Split on ' | '
+    parts = [p.strip() for p in rest.split("|")]
+    if len(parts) < 3:
+        return None
+
+    # Name (Title) part
+    name_part = parts[0]
+    name_m = re.match(r"(.+?)\s*\((.+?)\)", name_part)
+    name  = name_m.group(1).strip() if name_m else name_part.strip()
+    title = name_m.group(2).strip() if name_m else ""
+
+    email  = parts[1].strip() if len(parts) > 1 else ""
+    status = parts[2].strip() if len(parts) > 2 else STATUS_DISCOVERED
+
+    # Get LinkedIn URL from rich text link if present
+    linkedin_url = ""
+    for rt in block.get("bulleted_list_item", {}).get("rich_text", []):
+        link = rt.get("text", {}).get("link")
+        if link and "linkedin.com" in link.get("url", ""):
+            linkedin_url = link["url"]
+            break
+
+    return {
+        "block_id":     block["id"],
+        "name":         name,
+        "title":        title,
+        "email":        email if email != "No email" else "",
+        "contact_type": contact_type_label,
+        "linkedin_url": linkedin_url,
+        "status":       status,
+    }
 
 
 def _block_text(block: dict) -> str:
     btype = block.get("type", "")
     rich  = block.get(btype, {}).get("rich_text", [])
     return "".join(rt.get("plain_text", "") for rt in rich)
+
+
+import re  # needed for _parse_contact_block

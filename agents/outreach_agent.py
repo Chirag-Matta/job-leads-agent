@@ -3,7 +3,7 @@ import logging
 from openai import OpenAI
 from config import config
 from tools.gmail import send_email
-from tools.tracker import get_discovered_companies, update_application_status, STATUS_MAIL_SENT
+from tools.tracker import get_discovered_companies, update_contact_status, STATUS_MAIL_SENT
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +35,7 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "update_application_status",
+            "name": "update_contact_status",
             "description": "Update the status of a company record in the Notion tracker.",
             "parameters": {
                 "type": "object",
@@ -61,11 +61,10 @@ def dispatch_tool(name: str, args: dict) -> str:
         )
         return json.dumps({"success": success})
 
-    elif name == "update_application_status":
-        success = update_application_status(
-            page_id=args["page_id"],
-            status=args["status"],
-            notes=args.get("notes", ""),
+    elif name == "update_contact_status":
+        success = update_contact_status(
+            block_id=args["page_id"],
+            new_status=args["status"],
         )
         return json.dumps({"success": success})
 

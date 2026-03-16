@@ -1,33 +1,53 @@
+"""
+agents/discovery_agent.py
+
+Full discovery flow:
+  1. Search job boards (Wellfound, HN, Naukri, LinkedIn via Serper)
+  2. LLM filters by role + company preferences
+  3. For each matched company → find 5 contacts via Serper
+     (2 HR, 2 SDE, 1 Founder)
+  4. Enrich each contact's email via Apollo
+  5. Save company + contacts to Notion
+"""
+
 import json
 import logging
 from openai import OpenAI
 from config import config
 from tools.jobs import search_jobs
-from tools.tracker import save_company_record
+from tools.contacts import find_contacts
+from tools.apollo import enrich_contacts
+from tools.tracker import save_company_with_contacts
 
 logger = logging.getLogger(__name__)
 
-# Use Groq via OpenAI-compatible endpoint
 client = OpenAI(
     api_key=config.groq_api_key,
     base_url="https://api.groq.com/openai/v1",
 )
 
-# ── Tool schemas ──────────────────────────────────────────────────────────────
+# ── Tool schemas ──────────────────────────────────────────────
 
 TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "search_jobs",
-            "description": "Search multiple job boards and LinkedIn posts for jobs matching keywords. Returns a list of real job listings with company name, description, job URL, and source.",
+            "description": (
+                "Search job boards for relevant openings. "
+                "Returns list of jobs with company, title, description, job_url, source."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "keywords": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "List of job role keywords to search for.",
+                        "description": "Job role keywords to search for.",
+                    },
+                    "location": {
+                        "type": "string",
+                        "description": "Location filter e.g. 'Bangalore'.",
                     },
                 },
                 "required": ["keywords"],
@@ -37,89 +57,138 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "save_company_record",
-            "description": "Save a discovered company to the Notion tracker. Only use REAL data from search results — never invent company names, contacts, or emails.",
+            "name": "find_and_save_company",
+            "description": (
+                "For a single matched company: find 5 contacts (2 HR, 2 SDE, 1 Founder) "
+                "via Google/Serper, enrich their emails via Apollo, then save everything "
+                "to the Notion tracker. Call this once per company."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "company": {"type": "string", "description": "Real company name from search results"},
-                    "role": {"type": "string", "description": "Job role title"},
-                    "contact_name": {"type": "string", "description": "Contact name if found in the listing, otherwise 'Unknown'"},
-                    "contact_email": {"type": "string", "description": "Contact email if found in the listing, otherwise 'Unknown'"},
-                    "contact_title": {"type": "string", "description": "Contact's job title if found, otherwise 'Unknown'"},
-                    "job_url": {"type": "string", "description": "URL to the job posting or LinkedIn post"},
-                    "company_linkedin": {"type": "string", "description": "Company LinkedIn URL if available"},
+                    "company": {
+                        "type": "string",
+                        "description": "Exact company name from search results.",
+                    },
+                    "role": {
+                        "type": "string",
+                        "description": "Job role title for this position.",
+                    },
+                    "job_url": {
+                        "type": "string",
+                        "description": "URL of the job posting.",
+                    },
                 },
-                "required": ["company", "role", "contact_name", "contact_email", "contact_title"],
+                "required": ["company", "role", "job_url"],
             },
         },
     },
 ]
 
-# ── Tool dispatcher ───────────────────────────────────────────────────────────
+# ── Tool dispatcher ───────────────────────────────────────────
 
 def dispatch_tool(name: str, args: dict) -> str:
     if name == "search_jobs":
-        locations = ", ".join(config.preferred_locations)
         results = search_jobs(
             keywords=args["keywords"],
-            location=locations,
+            location=args.get("location", ",".join(config.preferred_locations)),
             serper_api_key=config.serper_api_key,
         )
         return json.dumps(results)
 
-    elif name == "save_company_record":
-        page_id = save_company_record(**args)
-        return json.dumps({"page_id": page_id, "status": "saved" if page_id else "failed"})
+    elif name == "find_and_save_company":
+        company = args["company"]
+        role    = args["role"]
+        job_url = args.get("job_url", "")
+
+        print(f"\n  → Processing: {company}")
+
+        # Step 1: Find 5 contacts via Serper
+        print(f"    [1/3] Finding contacts...")
+        contacts = find_contacts(
+            company=company,
+            applicant_role=config.your_role,
+            serper_api_key=config.serper_api_key,
+        )
+
+        if not contacts:
+            logger.warning(f"No contacts found for {company} — skipping.")
+            return json.dumps({"status": "skipped", "reason": "no contacts found"})
+
+        # Step 2: Enrich emails via Apollo
+        print(f"    [2/3] Enriching emails for {len(contacts)} contacts via Apollo...")
+        contacts = enrich_contacts(
+            contacts=contacts,
+            company=company,
+            api_key=config.apollo_api_key,
+        )
+
+        emails_found = sum(1 for c in contacts if c.get("email"))
+        print(f"    [2/3] Emails found: {emails_found}/{len(contacts)}")
+
+        # Step 3: Save to Notion
+        print(f"    [3/3] Saving to Notion...")
+        page_id = save_company_with_contacts(
+            company=company,
+            role=role,
+            job_url=job_url,
+            contacts=contacts,
+        )
+
+        if page_id:
+            print(f"    ✓ Saved {company} — {len(contacts)} contacts")
+            return json.dumps({
+                "status": "saved",
+                "company": company,
+                "contacts_saved": len(contacts),
+                "emails_found": emails_found,
+                "page_id": page_id,
+            })
+        else:
+            return json.dumps({"status": "failed", "reason": "Notion save error"})
 
     return json.dumps({"error": f"Unknown tool: {name}"})
 
 
-# ── Agent loop ────────────────────────────────────────────────────────────────
+# ── Agent loop ────────────────────────────────────────────────
 
 def run_discovery_agent() -> None:
     """
-    Runs the discovery agent.
-    Searches job boards and LinkedIn posts, filters to preferences,
-    and saves real results to Notion.
+    Runs the full discovery agent:
+      search → filter → find contacts → enrich emails → save to Notion
     """
-    locations_str = ', '.join(config.preferred_locations)
-    remote_note = ' (also open to remote)' if config.open_to_remote else ''
+    locations_str = ", ".join(config.preferred_locations)
+    remote_note   = " (also open to remote)" if config.open_to_remote else ""
 
-    system_prompt = f"""You are a job discovery agent. Your job is to find relevant companies and roles for a job seeker.
+    system_prompt = f"""You are a job discovery agent. Find the best companies for a job seeker and save them to Notion.
 
-Job seeker preferences:
-- Roles: {', '.join(config.job_roles)}
-- Company types: {', '.join(config.target_company_types)}
-- Domains / industries: {', '.join(config.target_domains)}
-- Company size: {', '.join(config.preferred_company_size)}
+Job seeker profile:
+- Target roles: {", ".join(config.job_roles)}
+- Company types: {", ".join(config.target_company_types)}
+- Domains: {", ".join(config.target_domains)}
+- Company size: {", ".join(config.preferred_company_size)}
 - Locations: {locations_str}{remote_note}
-- Work mode: {config.work_mode}
-- Experience level: {config.experience_level}
-- Max companies to process: {config.max_companies_per_run}
-{'- EXCLUDE these companies: ' + ', '.join(config.excluded_companies) if config.excluded_companies else ''}
+- Experience: {config.experience_level}
+- Max companies this run: {config.max_companies_per_run}
+- Exclude: {", ".join(config.excluded_companies) if config.excluded_companies else "none"}
 
-CRITICAL RULES:
-- You may ONLY use data that comes from the search_jobs results. 
-- NEVER invent or fabricate company names, contact names, emails, or URLs.
-- If a search result does not include a contact name or email, use "Unknown" for those fields.
-- Use the REAL company name and job_url exactly as returned by search_jobs.
-- Do NOT use placeholder names like "Example Startup" or "johndoe@example.com".
+STRICT RULES:
+- Only use REAL company names from search results — never invent any.
+- Never invent contact names, emails, or URLs.
+- Skip any company in the exclusion list.
 
 Your workflow:
-1. Call search_jobs with the job roles as keywords.
-2. Review the REAL results returned. Pick the top {config.max_companies_per_run} most relevant companies.
-3. SKIP any company in the exclusion list.
-4. Prefer companies that match the target domains, company type, and size.
-5. For each selected company, call save_company_record using ONLY the data from the search results.
-6. Use the poster_name field (if available) as contact_name, and set contact_email to "Unknown" if not found.
-7. Summarise what you saved at the end.
-
-Be selective — only pick companies that closely match the preferences."""
+1. Call search_jobs with the target roles as keywords and the preferred location.
+2. Review ALL returned results. Pick the top {config.max_companies_per_run} companies that best match:
+   - Company type, domain, size
+   - Role relevance
+   - Location
+3. For EACH selected company, call find_and_save_company once.
+4. After processing all companies, give a summary of what was saved."""
 
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": "Run the job discovery flow now."},
+        {"role": "user",   "content": "Run the job discovery flow now."},
     ]
 
     logger.info("Starting discovery agent...")
@@ -135,22 +204,18 @@ Be selective — only pick companies that closely match the preferences."""
         message = response.choices[0].message
         messages.append(message)
 
-        # No more tool calls — agent is done
         if not message.tool_calls:
-            logger.info(f"Discovery agent finished:\n{message.content}")
             print(f"\n[Discovery Agent] Done:\n{message.content}\n")
+            logger.info(f"Discovery agent finished: {message.content}")
             break
 
-        # Execute each tool call
         for tc in message.tool_calls:
-            name = tc.function.name
-            args = json.loads(tc.function.arguments)
-            logger.info(f"Tool call: {name}({args})")
-
+            name   = tc.function.name
+            args   = json.loads(tc.function.arguments)
+            logger.info(f"Tool call → {name}({list(args.keys())})")
             result = dispatch_tool(name, args)
-
             messages.append({
-                "role": "tool",
+                "role":         "tool",
                 "tool_call_id": tc.id,
-                "content": result,
+                "content":      result,
             })
