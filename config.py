@@ -16,7 +16,8 @@ class Config:
     gmail_app_password: str = os.getenv("GMAIL_APP_PASSWORD", "")
 
     # ── LLM ───────────────────────────────────────────────
-    model: str = "llama-3.3-70b-versatile"
+    model: str = "llama-3.3-70b-versatile"   # primary
+    fallback_model: str = "llama-3.1-8b-instant"  # when 70b hits limit
 
     # ── Job Search Preferences ─────────────────────────────
     job_roles: List[str] = field(default_factory=lambda: [
@@ -33,7 +34,6 @@ class Config:
     ])
     preferred_company_size: List[str] = field(default_factory=lambda: [
         "early-stage",
-        "mid-size",
     ])
     preferred_locations: List[str] = field(default_factory=lambda: [
         "Bangalore",
